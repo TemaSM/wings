@@ -93,6 +93,61 @@ func (h *Handler) Fileread(request *sftp.Request) (io.ReaderAt, error) {
 	return f, nil
 }
 
+const bufSize = 5 * 1024 * 1024
+
+type bufferedWriterAt struct {
+	file   io.WriterAt
+	buf    []byte
+	bufOff int64
+	mu     sync.Mutex
+	closed bool
+}
+
+func (bw *bufferedWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	bw.mu.Lock()
+	defer bw.mu.Unlock()
+	if bw.closed {
+		return 0, io.ErrClosedPipe
+	}
+	if off != bw.bufOff || len(bw.buf)+len(p) > cap(bw.buf) {
+		if len(bw.buf) > 0 {
+			if _, err := bw.file.WriteAt(bw.buf, bw.bufOff); err != nil {
+				return 0, err
+			}
+			bw.buf = bw.buf[:0]
+		}
+		bw.bufOff = off
+	}
+	bw.buf = append(bw.buf, p...)
+	if len(bw.buf) >= bufSize {
+		if _, err := bw.file.WriteAt(bw.buf, bw.bufOff); err != nil {
+			return 0, err
+		}
+		bw.buf = bw.buf[:0]
+		bw.bufOff = off + int64(len(p))
+	}
+	return len(p), nil
+}
+
+func (bw *bufferedWriterAt) Close() error {
+	bw.mu.Lock()
+	defer bw.mu.Unlock()
+	if bw.closed {
+		return nil
+	}
+	if len(bw.buf) > 0 {
+		if _, err := bw.file.WriteAt(bw.buf, bw.bufOff); err != nil {
+			return err
+		}
+		bw.buf = nil
+	}
+	bw.closed = true
+	if c, ok := bw.file.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
+}
+
 // Filewrite handles the write actions for a file on the system.
 func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 	if h.ro {
@@ -107,7 +162,7 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	
+
 	if err := h.fs.IsIgnored(request.Filepath); err != nil {
 		return nil, err
 	}
@@ -141,7 +196,13 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 		event = server.ActivitySftpCreate
 	}
 	h.events.MustLog(event, FileAction{Entity: request.Filepath})
-	return f, nil
+
+	bw := &bufferedWriterAt{
+		file:   f,
+		buf:    make([]byte, 0, bufSize),
+		bufOff: 0,
+	}
+	return bw, nil
 }
 
 // Filecmd hander for basic SFTP system calls related to files, but not anything to do with reading
@@ -158,7 +219,7 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 	if err := h.fs.IsIgnored(request.Filepath); err != nil {
 		return err
 	}
-	
+
 	switch request.Method {
 	// Allows a user to make changes to the permissions of a given file or directory
 	// on their server using their SFTP client.
